@@ -35,6 +35,13 @@ if [[ "${1:-}" == "--clean" ]]; then
   exit 0
 fi
 
+# Never stamp a pre-existing, foreign vault: --clean would then delete it.
+if [[ -d "$VAULT" ]] && [[ -n "$(ls -A "$VAULT" 2>/dev/null)" ]] && [[ ! -f "$VAULT/.mdvault-demo" ]]; then
+  echo "refusing: $VAULT already has content and is not a demo vault" >&2
+  echo "set VAULT=/path/to/a/fresh/dir, or remove it manually" >&2
+  exit 1
+fi
+
 mkdir -p "$VAULT"/{projects/relocation,notes,japanese,inbox}
 
 cat >"$VAULT/projects/relocation/ireland.md" <<'EOF'

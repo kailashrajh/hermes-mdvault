@@ -42,6 +42,8 @@ def choose_note(folder: Path) -> tuple[Path, str]:
     for candidate in candidates:
         if not candidate.exists():
             return candidate, ""
+        if candidate.is_symlink():
+            continue
         try:
             text = candidate.read_text(encoding="utf-8-sig")
         except OSError:
@@ -76,6 +78,8 @@ def apply_memory_write(
 
     folder.mkdir(parents=True, exist_ok=True)
     path, text = choose_note(folder)
+    if path.is_symlink():
+        raise ValueError(f"refusing to follow symlinked mirror note: {path}")
     if not text:
         text = _initial()
     lines = text.splitlines()

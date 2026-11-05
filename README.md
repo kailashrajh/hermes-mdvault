@@ -128,7 +128,8 @@ the filename.
 - **Reads** only the configured vault folder: excluded directories are skipped, directory
   symlinks are not followed, and a **file symlink inside the vault is skipped** rather than read
   (otherwise a link to `~/.ssh/id_rsa` would be indexed).
-- **Writes** are confined to the vault: a folder is rejected if it is absolute, contains `..`, or
+- **Writes** are confined to the vault: a leading `/` is stripped so the folder is treated as vault-relative,
+  and a folder is rejected if it contains `..`, escapes the vault, or
   names an excluded directory, and containment is checked *before* any file is created. New notes
   use `O_EXCL`, so an existing file is never replaced — not even by a racing writer. The mirror
   only rewrites a note carrying its own `<!-- managed by mdvault -->` marker; any other

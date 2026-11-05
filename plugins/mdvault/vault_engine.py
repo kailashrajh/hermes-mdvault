@@ -36,7 +36,7 @@ INDEX_FORMAT = 2
 # Latin/digit runs or CJK runs. Splitting them at the regex level is what keeps
 # "Docker化する" searchable: one mixed token would send the whole thing down the
 # CJK-bigram path and silently lose "docker".
-_LATIN_RE = r"[A-Za-z0-9_]+"
+_LATIN_RE = r"[^\W\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]+"
 _CJK_RANGE = r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]"
 _TOKEN_RE = re.compile(rf"{_LATIN_RE}|{_CJK_RANGE}+", re.UNICODE)
 _CJK_RE = re.compile(_CJK_RANGE)
@@ -168,6 +168,21 @@ class Config:
         return cfg
 
 
+def _decode_frontmatter_scalar(value: str) -> str:
+    """Decode a scalar the writer emitted (JSON-quoted) or a plain quoted string."""
+    value = value.strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        try:
+            decoded = json.loads(value)
+            if isinstance(decoded, str):
+                return decoded
+        except (json.JSONDecodeError, ValueError):
+            pass
+    if len(value) >= 2 and value.startswith("'") and value.endswith("'"):
+        return value[1:-1]
+    return value.strip("\"'")
+
+
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str, int]:
     """Minimal YAML frontmatter reader: scalars and inline/bullet lists only."""
     text = text.lstrip("\ufeff")
@@ -184,7 +199,7 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str, int]:
         if bullet and current_list:
             meta.setdefault(current_list, [])
             if isinstance(meta[current_list], list):
-                meta[current_list].append(bullet.group(1).strip().strip("'\""))
+                meta[current_list].append(_decode_frontmatter_scalar(bullet.group(1).strip()))
             continue
         kv = re.match(r"^([A-Za-z0-9_.\-]+)\s*:\s*(.*)$", line)
         if not kv:
@@ -196,9 +211,9 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str, int]:
             continue
         current_list = None
         if value.startswith("[") and value.endswith("]"):
-            meta[key] = [v.strip().strip("'\"") for v in value[1:-1].split(",") if v.strip()]
+            meta[key] = [_decode_frontmatter_scalar(v.strip()) for v in value[1:-1].split(",") if v.strip()]
         else:
-            meta[key] = value.strip("'\"")
+            meta[key] = _decode_frontmatter_scalar(value)
     return meta, text[match.end() :], match.end()
 
 
