@@ -15,3 +15,9 @@ spec = importlib.util.spec_from_file_location("vault_engine", ENGINE)
 module = importlib.util.module_from_spec(spec)
 sys.modules["vault_engine"] = module
 spec.loader.exec_module(module)
+
+MIRROR = ROOT / "plugins" / "mdvault" / "mirror.py"
+mirror_spec = importlib.util.spec_from_file_location("mirror", MIRROR)
+mirror_module = importlib.util.module_from_spec(mirror_spec)
+sys.modules["mirror"] = mirror_module
+mirror_spec.loader.exec_module(mirror_module)

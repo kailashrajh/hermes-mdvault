@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 
+from .mirror import apply_memory_write
 from .vault_engine import Config, VaultIndex, resolve_write_dir, write_note
 
 logger = logging.getLogger(__name__)
@@ -447,85 +448,10 @@ class VaultMemoryProvider(MemoryProvider):
     def _write_mirror(self, action: str, target: str, content: str, previous: str) -> None:
         engine = self._ensure_engine()
         folder = resolve_write_dir(self._config, self._config.write_folder or "inbox")
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / "Hermes memory.md"
-        marker = "<!-- managed by mdvault -->"
-        heading = f"## {'User profile' if target == 'user' else 'Agent memory'}"
-        bullet = "- " + self._normalise_entry(content)
-
-        if path.exists():
-            text = path.read_text(encoding="utf-8-sig")
-            if marker not in text:
-                # Never rewrite a note this plugin did not create.
-                path = folder / "Hermes memory (mdvault).md"
-                text = path.read_text(encoding="utf-8-sig") if path.exists() else ""
-        else:
-            text = ""
-
-        if not text:
-            text = (
-                "# Hermes memory\n\n"
-                f"{marker}\n"
-                "Mirrored from Hermes's built-in memory store by the mdvault plugin. "
-                "Safe to move, edit or delete.\n"
-            )
-        lines = text.splitlines()
-
-        def find_heading() -> int:
-            for index, line in enumerate(lines):
-                if line.strip() == heading:
-                    return index
-            return -1
-
-        if find_heading() == -1:
-            lines.extend(["", heading])
-        heading_index = find_heading()
-
-        def section_bounds() -> tuple[int, int]:
-            start = heading_index
-            end = len(lines)
-            for index in range(start + 1, len(lines)):
-                if lines[index].startswith("## "):
-                    end = index
-                    break
-            return start, end
-
-        def remove_entry(needle: str) -> bool:
-            if not needle:
-                return False
-            wanted = self._normalise_entry(needle)
-            start, end = section_bounds()
-            for index in range(end - 1, start, -1):
-                line = lines[index]
-                if line.startswith("- ") and self._normalise_entry(line[2:]) == wanted:
-                    del lines[index]
-                    return True
-            return False
-
-        def insert_entry() -> None:
-            start, end = section_bounds()
-            insert_at = end
-            # Keep bullets contiguous at the end of their own section.
-            while insert_at - 1 > start and not lines[insert_at - 1].startswith("- "):
-                insert_at -= 1
-            lines.insert(insert_at, bullet)
-
-        if action == "add":
-            insert_entry()
-        elif action == "replace":
-            remove_entry(previous)
-            insert_entry()
-        elif action == "remove":
-            if not remove_entry(previous or content):
-                return
-        else:
-            return
-
-        # Atomic replace: a sync client or a second turn can never see a half-written file.
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-        engine.refresh()
+        with self._lock:
+            path = apply_memory_write(folder, action, target, content, previous)
+        if path is not None:
+            engine.refresh()
 
     # -- config -----------------------------------------------------------
 
