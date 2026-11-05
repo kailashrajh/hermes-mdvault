@@ -29,7 +29,7 @@ from typing import Any, Optional
 
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 
-from .vault_engine import Config, VaultIndex, write_note
+from .vault_engine import Config, VaultIndex, resolve_write_dir, write_note
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,30 @@ _SCHEMA = [
         "description": "Vault-relative folder for notes the agent writes",
         "default": "inbox",
     },
+    {
+        "key": "prefetch_limit",
+        "description": "Notes injected per turn (0 disables auto-recall)",
+        "type": "integer",
+        "default": 4,
+    },
+    {
+        "key": "prefetch_chars",
+        "description": "Character budget for the injected recall block",
+        "type": "integer",
+        "default": 1800,
+    },
+    {
+        "key": "max_notes",
+        "description": "Stop indexing after this many notes (0 = no cap)",
+        "type": "integer",
+        "default": 5000,
+    },
+    {
+        "key": "mirror_writes",
+        "description": "Mirror built-in Hermes memory writes into a vault note",
+        "type": "boolean",
+        "default": True,
+    },
 ]
 
 
@@ -161,7 +185,12 @@ def _config_yaml_block() -> dict[str, Any]:
 
 
 def _resolve_settings(hermes_home: Path) -> dict[str, Any]:
-    """env var → config.yaml block → sidecar JSON written by setup."""
+    """Precedence, lowest to highest: sidecar/dashboard JSON → config.yaml block → env var.
+
+    This matches ``cli._settings()``. Sidecar first means a value saved by
+    ``hermes memory setup`` or the dashboard survives even when ``config.yaml`` carries
+    a stale ``memory.mdvault`` block, and ``HERMES_VAULT_PATH`` wins for per-project runs.
+    """
     settings: dict[str, Any] = {}
     settings.update(_sidecar_config(hermes_home))
     settings.update({k: v for k, v in _config_yaml_block().items() if v not in (None, "")})
@@ -180,7 +209,6 @@ class VaultMemoryProvider(MemoryProvider):
         self._agent_context = "primary"
         self._lock = threading.Lock()
         self._last_recall = RecallStatus(provider_label="Vault", count=0)
-        self._queued: Optional[tuple[str, list[dict[str, Any]]]] = None
         self._unavailable = ""
 
     # -- identity ---------------------------------------------------------
@@ -252,18 +280,17 @@ class VaultMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if not self._config or not self._config.auto_recall or is_trivial_prompt(query):
+        if (
+            not self._config
+            or not self._config.auto_recall
+            or self._config.prefetch_limit <= 0
+            or is_trivial_prompt(query)
+        ):
             self._last_recall = RecallStatus(provider_label="Vault", count=0)
             return ""
         try:
-            results = None
-            with self._lock:
-                if self._queued and self._queued[0] == query:
-                    results = self._queued[1]
-                    self._queued = None
             engine = self._ensure_engine()
-            if results is None:
-                results = engine.search(query, limit=self._config.prefetch_limit)
+            results = engine.search(query, limit=self._config.prefetch_limit)
             if not results:
                 self._last_recall = RecallStatus(provider_label="Vault", count=0)
                 return ""
@@ -275,41 +302,42 @@ class VaultMemoryProvider(MemoryProvider):
             self._last_recall = RecallStatus(provider_label="Vault", count=0)
             return ""
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Warm the next turn's recall — cheap enough to run inline, measured in ms."""
-        if not self._config or not self._config.auto_recall or is_trivial_prompt(query):
-            return
-        try:
-            engine = self._ensure_engine()
-            results = engine.search(query, limit=self._config.prefetch_limit)
-        except Exception:
-            return
-        with self._lock:
-            self._queued = (query, results)
-
     def recall_status(self) -> Optional[RecallStatus]:
         return self._last_recall
 
     def _format_recall(self, results: list[dict[str, Any]]) -> str:
-        budget = self._config.prefetch_chars if self._config else 1800
-        lines = ['<vault_memory source="mdvault">']
-        used = 0
+        budget = max(200, self._config.prefetch_chars if self._config else 1800)
+        opener, closer = '<vault_memory source="mdvault">', "</vault_memory>"
+        lines = [opener]
+        used = len(opener) + len(closer)
         for item in results:
             tags = f" [{', '.join(item['tags'][:4])}]" if item.get("tags") else ""
             head = f"### {item['title']} ({item['path']}, {item['modified'][:10]}, {item['score']:.2f}){tags}"
             body = (item.get("snippet") or "").strip()
-            chunk = f"{head}\n{body}\n"
-            if used + len(chunk) > budget and used > 0:
+            remaining = budget - used
+            if remaining <= len(head) + 8:
                 break
-            lines.append(chunk.rstrip())
-            used += len(chunk)
-        lines.append("</vault_memory>")
+            chunk = f"{head}\n{body}"
+            if len(chunk) > remaining:
+                # The budget applies to the FIRST note too: truncate rather than
+                # overrun it, and never emit a head with no room for its body.
+                chunk = chunk[: max(0, remaining - 1)].rstrip() + "…"
+            lines.append(chunk)
+            used += len(chunk) + 1
+        lines.append(closer)
         return "\n".join(lines)
 
     # -- tools ------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return list(_TOOLS)
+
+    @staticmethod
+    def _int_arg(value: Any, default: int, low: int, high: int) -> int:
+        try:
+            return min(max(int(float(value)), low), high)
+        except (TypeError, ValueError):
+            return default
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         try:
@@ -321,7 +349,7 @@ class VaultMemoryProvider(MemoryProvider):
                 query = str(args.get("query") or "").strip()
                 if not query:
                     return json.dumps({"error": "query is required"})
-                limit = min(max(int(args.get("limit") or 6), 1), 20)
+                limit = self._int_arg(args.get("limit"), 6, 1, 20)
                 results = engine.search(
                     query,
                     limit=limit,
@@ -333,11 +361,11 @@ class VaultMemoryProvider(MemoryProvider):
                     ensure_ascii=False,
                 )
             if tool_name == "mdvault_note":
-                path = str(args.get("path") or "").strip().lstrip("./")
+                path = str(args.get("path") or "").strip()
                 note = engine.note(path)
                 if note is None:
                     return json.dumps({"error": f"no note at {path!r}"})
-                max_chars = min(max(int(args.get("max_chars") or 8000), 200), 40000)
+                max_chars = self._int_arg(args.get("max_chars"), 8000, 200, 40000)
                 body = note.text[:max_chars]
                 return json.dumps(
                     {
@@ -351,8 +379,8 @@ class VaultMemoryProvider(MemoryProvider):
                     ensure_ascii=False,
                 )
             if tool_name == "mdvault_recent":
-                days = min(max(int(args.get("days") or 7), 1), 3650)
-                limit = min(max(int(args.get("limit") or 10), 1), 50)
+                days = self._int_arg(args.get("days"), 7, 1, 3650)
+                limit = self._int_arg(args.get("limit"), 10, 1, 50)
                 notes = engine.recent(days=days, limit=limit, folder=args.get("folder") or None)
                 return json.dumps(
                     {"days": days, "count": len(notes), "results": [n.to_public() for n in notes]},
@@ -385,54 +413,118 @@ class VaultMemoryProvider(MemoryProvider):
     # -- memory mirror ----------------------------------------------------
 
     def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[dict[str, Any]] = None) -> None:
-        """Mirror built-in memory writes into a human-readable vault note."""
+        """Mirror built-in memory writes into a human-readable vault note.
+
+        ``remove`` arrives with an EMPTY ``content`` and the deleted entry in
+        ``metadata["previous_content"]`` — guarding on content first silently dropped
+        every removal, so a fact the user deleted stayed in the vault and could be
+        recalled again. Destructive actions without identity are skipped: the ABC says
+        a provider that needs exact identity must not mirror destructively without it.
+        """
         if not self._config or not self._config.mirror_writes or self._agent_context not in ("primary", ""):
             return
+        action = (action or "").strip().lower()
         content = (content or "").strip()
-        if not content:
-            return
         previous = ""
         if isinstance(metadata, dict):
             previous = str(metadata.get("previous_content") or "").strip()
+        if action not in ("add", "replace", "remove"):
+            return
+        if action == "add" and not content:
+            return
+        if action in ("replace", "remove") and not (previous or (action == "remove" and content)):
+            logger.debug("mdvault: skipping %s mirror without entry identity", action)
+            return
         try:
             self._write_mirror(action, target, content, previous)
         except Exception as exc:
             logger.warning("mdvault mirror failed: %s", exc)
 
+    @staticmethod
+    def _normalise_entry(text: str) -> str:
+        return " ".join((text or "").split())
+
     def _write_mirror(self, action: str, target: str, content: str, previous: str) -> None:
         engine = self._ensure_engine()
-        folder = (self._config.write_folder or "inbox").strip("/")
-        path = self._config.vault_path / folder / "Hermes memory.md"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        folder = resolve_write_dir(self._config, self._config.write_folder or "inbox")
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "Hermes memory.md"
+        marker = "<!-- managed by mdvault -->"
         heading = f"## {'User profile' if target == 'user' else 'Agent memory'}"
-        text = path.read_text(encoding="utf-8") if path.exists() else "# Hermes memory\n\nMirrored from Hermes's built-in memory store. Edited by the agent; safe to move or delete.\n"
+        bullet = "- " + self._normalise_entry(content)
+
+        if path.exists():
+            text = path.read_text(encoding="utf-8-sig")
+            if marker not in text:
+                # Never rewrite a note this plugin did not create.
+                path = folder / "Hermes memory (mdvault).md"
+                text = path.read_text(encoding="utf-8-sig") if path.exists() else ""
+        else:
+            text = ""
+
+        if not text:
+            text = (
+                "# Hermes memory\n\n"
+                f"{marker}\n"
+                "Mirrored from Hermes's built-in memory store by the mdvault plugin. "
+                "Safe to move, edit or delete.\n"
+            )
         lines = text.splitlines()
-        bullet = "- " + " ".join(content.split())
+
+        def find_heading() -> int:
+            for index, line in enumerate(lines):
+                if line.strip() == heading:
+                    return index
+            return -1
+
+        if find_heading() == -1:
+            lines.extend(["", heading])
+        heading_index = find_heading()
+
+        def section_bounds() -> tuple[int, int]:
+            start = heading_index
+            end = len(lines)
+            for index in range(start + 1, len(lines)):
+                if lines[index].startswith("## "):
+                    end = index
+                    break
+            return start, end
 
         def remove_entry(needle: str) -> bool:
             if not needle:
                 return False
-            norm = " ".join(needle.split())
-            for index, line in enumerate(lines):
-                if line.startswith("- ") and " ".join(line[2:].split()) == norm:
+            wanted = self._normalise_entry(needle)
+            start, end = section_bounds()
+            for index in range(end - 1, start, -1):
+                line = lines[index]
+                if line.startswith("- ") and self._normalise_entry(line[2:]) == wanted:
                     del lines[index]
                     return True
             return False
 
+        def insert_entry() -> None:
+            start, end = section_bounds()
+            insert_at = end
+            # Keep bullets contiguous at the end of their own section.
+            while insert_at - 1 > start and not lines[insert_at - 1].startswith("- "):
+                insert_at -= 1
+            lines.insert(insert_at, bullet)
+
         if action == "add":
-            if heading not in lines:
-                lines.extend(["", heading])
-            lines.append(bullet)
+            insert_entry()
         elif action == "replace":
-            if not remove_entry(previous or content):
-                if heading not in lines:
-                    lines.extend(["", heading])
-            lines.append(bullet)
+            remove_entry(previous)
+            insert_entry()
         elif action == "remove":
-            remove_entry(previous or content)
+            if not remove_entry(previous or content):
+                return
         else:
             return
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        # Atomic replace: a sync client or a second turn can never see a half-written file.
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
         engine.refresh()
 
     # -- config -----------------------------------------------------------
@@ -445,10 +537,21 @@ class VaultMemoryProvider(MemoryProvider):
         target_dir = home / PROVIDER_NAME
         target_dir.mkdir(parents=True, exist_ok=True)
         current = _sidecar_config(home)
-        for key in ("vault_path", "auto_recall", "write_folder", "prefetch_limit", "prefetch_chars", "max_notes", "mirror_writes"):
+        for key in (
+            "vault_path",
+            "auto_recall",
+            "write_folder",
+            "prefetch_limit",
+            "prefetch_chars",
+            "max_notes",
+            "mirror_writes",
+        ):
             if key in values and values[key] not in (None, ""):
                 current[key] = values[key]
-        (target_dir / "config.json").write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+        # Atomic: a config read during a save must never see half a JSON document.
+        tmp = target_dir / f".config.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, target_dir / "config.json")
 
     def backup_paths(self) -> list[str]:
         # The vault lives outside HERMES_HOME on purpose: it is the user's own store and

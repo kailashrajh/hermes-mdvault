@@ -117,7 +117,7 @@ def cmd_reindex(args: argparse.Namespace) -> int:
 
 
 def cmd_trace(args: argparse.Namespace) -> int:
-    """Show why a note ranked where it did — one line per scoring component."""
+    """Show why a note ranked where it did: raw BM25 score and the fields that matched."""
     _, engine, error = _load()
     if error:
         print(error)
@@ -127,7 +127,8 @@ def cmd_trace(args: argparse.Namespace) -> int:
         print("No matches.")
         return 0
     for item in results:
-        print(f"{item['score']:.2f}  {item['path']}  {item['title']}")
+        fields = ", ".join(item.get("matched_in") or []) or "—"
+        print(f"{item['raw_score']:8.3f}  {item['path']:<48} {item['title']}  [{fields}]")
     return 0
 
 
@@ -141,7 +142,7 @@ def register_cli(subparser) -> None:
     search.add_argument("--tag")
     search.add_argument("--json", action="store_true")
     subs.add_parser("reindex", help="Rebuild the in-memory index from disk")
-    trace = subs.add_parser("explain", help="Show ranked paths for a query")
+    trace = subs.add_parser("explain", help="Raw score and matched fields for a query")
     trace.add_argument("query")
     trace.add_argument("--limit", type=int, default=6)
     subparser.set_defaults(func=_dispatch)

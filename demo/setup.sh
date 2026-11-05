@@ -15,9 +15,19 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 unset HERMES_HOME
 
 clean() {
-  rm -rf "$VAULT" "$(dirname "$VAULT")"
-  hermes profile delete "$PROFILE" --yes 2>/dev/null || hermes profile delete "$PROFILE" <<<"y" || true
-  echo "removed profile $PROFILE and $VAULT"
+  if [[ -f "$VAULT/.mdvault-demo" ]]; then
+    rm -rf "$VAULT"
+    echo "removed demo vault $VAULT"
+  else
+    echo "refusing to delete $VAULT (not created by this script)"
+  fi
+  local home="${HERMES_HOME:-$HOME/.hermes}"
+  if [[ -f "$home/profiles/$PROFILE/.mdvault-demo" ]]; then
+    rm -rf "$home/profiles/$PROFILE" "$HOME/.local/bin/$PROFILE"
+    echo "removed demo profile $PROFILE"
+  else
+    echo "refusing to delete profile $PROFILE (not created by this script)"
+  fi
 }
 
 if [[ "${1:-}" == "--clean" ]]; then
@@ -75,9 +85,13 @@ EOF
 
 mkdir -p "$VAULT/.obsidian"
 echo "this file must never appear in results" >"$VAULT/.obsidian/workspace.md"
+# Ownership marker: --clean only removes what this script created.
+date -u +%Y-%m-%dT%H:%M:%SZ >"$VAULT/.mdvault-demo"
 
+PROFILE_CREATED=0
 if ! hermes profile show "$PROFILE" >/dev/null 2>&1; then
   hermes profile create "$PROFILE" --clone
+  PROFILE_CREATED=1
 fi
 
 HERMES_DIR="${HERMES_HOME:-$HOME/.hermes}"
@@ -85,6 +99,9 @@ DEST="$HERMES_DIR/profiles/$PROFILE/plugins/mdvault"
 mkdir -p "$(dirname "$DEST")"
 rm -rf "$DEST"
 cp -r "$REPO/plugins/mdvault" "$DEST"
+if [[ "$PROFILE_CREATED" == "1" ]]; then
+  date -u +%Y-%m-%dT%H:%M:%SZ >"$HERMES_DIR/profiles/$PROFILE/.mdvault-demo"
+fi
 
 hermes -p "$PROFILE" plugins enable mdvault >/dev/null
 hermes -p "$PROFILE" config set memory.provider mdvault >/dev/null

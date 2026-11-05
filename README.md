@@ -36,9 +36,21 @@ hermes plugins enable mdvault
 hermes memory setup
 ```
 
-Only one external memory provider can be active at a time. Activating mdvault replaces the
-built-in `MEMORY.md`/`USER.md` injection — it does not run alongside it. Built-in memory writes
-can be mirrored into the vault (see `mirror_writes`), so nothing is lost.
+Only one external memory provider can be active at a time — but mdvault does **not** replace
+Hermes's built-in `MEMORY.md`/`USER.md`; it runs *alongside* them. Hermes builds both blocks
+whenever `memory.memory_enabled` / `memory.user_profile_enabled` are true (the defaults), and its
+system prompt is explicitly "additive to built-in". So the built-in store keeps being written and
+injected, and mdvault adds vault recall on top.
+
+If you want the vault to be the only memory, turn the built-in store off:
+
+```bash
+hermes config set memory.memory_enabled false
+hermes config set memory.user_profile_enabled false
+```
+
+With the built-ins left on, `mirror_writes` (default true) copies their writes into a vault note,
+so what the agent learns in `MEMORY.md` is also browsable, greppable and diffable as Markdown.
 
 ## Configuration
 
@@ -47,17 +59,22 @@ can be mirrored into the vault (see `mirror_writes`), so nothing is lost.
 | `vault_path` | *(required)* | Folder of Markdown notes. `~` is expanded. |
 | `auto_recall` | `true` | Inject the top notes into context before each turn. |
 | `write_folder` | `inbox` | Vault-relative folder for notes the agent writes. |
-| `prefetch_limit` | `4` | Notes injected per turn. |
-| `prefetch_chars` | `1800` | Character budget for the injected block. |
-| `max_notes` | `5000` | Stop indexing after this many notes. |
-| `max_file_bytes` | `1000000` | Skip notes larger than this. |
+| `prefetch_limit` | `4` | Notes injected per turn (`0` disables auto-recall). |
+| `prefetch_chars` | `1800` | Character budget for the injected block, first note included. |
+| `max_notes` | `5000` | Stop indexing after this many notes (`0` = no cap). |
 | `mirror_writes` | `true` | Mirror built-in memory writes into a vault note. |
-| `recency_half_life_days` | `180` | Strength of the recency tiebreak. |
-| `exclude_dirs` | `.obsidian, .git, node_modules, .trash, .venv, __pycache__` | Folders never indexed. |
+| `max_file_bytes` | `1000000` | Skip notes larger than this (`skipped` in status). |
+| `recency_half_life_days` | `180` | Strength of the recency factor. |
+| `exclude_dirs` | `.obsidian, .git, node_modules, .trash, .venv, __pycache__` | Folders never indexed and never written to. |
 | `include_globs` | `*.md, *.markdown` | File suffixes indexed. |
 
-Set them in `hermes memory setup`, in the dashboard's memory panel, under `memory.mdvault` in
-`config.yaml`, or with `HERMES_VAULT_PATH` for the path (handy for a per-project vault).
+The first seven are editable from `hermes memory setup` and the dashboard panel; the rest are
+file-only settings under `memory.mdvault` in `config.yaml`.
+
+**Precedence, lowest to highest:** `$HERMES_HOME/mdvault/config.json` (what setup and the
+dashboard write) → the `memory.mdvault` block in `config.yaml` → `HERMES_VAULT_PATH`. The env var
+wins so a per-shell override always takes effect; a `config.yaml` value overrides a stale panel
+save.
 
 ## Tools
 
@@ -92,10 +109,13 @@ Deliberately boring, local and explainable:
   count a little.
 - **Prefix credit.** A query term of four or more characters matches longer words
   (`automat` → `automation`).
-- **Light recency tiebreak**, then path order. Same query, same corpus, same ranking — always.
+- **Light recency factor**, then path order. Ranking is deterministic for a given corpus and
+  clock: every note in one query is scored against the same timestamp.
 
 The index lives in memory and is refreshed with a `stat()` sweep: only files whose mtime or size
-changed are re-read, so a turn costs a few milliseconds on a vault of a few thousand notes.
+changed are re-read. A search costs roughly 12–30 ms at 2,000 notes on a 2-vCPU box (measured with
+`scripts/bench.py`), a stat-only rescan ~100 ms, and `recent()` ~1 ms — fast enough to run inline
+before every turn, not free.
 
 The agent writes notes with YAML frontmatter (`title`, `tags`, `created`, `source: hermes`), and
 notes you wrote by hand work the same way — title from frontmatter, else the first heading, else
@@ -105,10 +125,14 @@ the filename.
 
 - **No network.** The plugin opens no sockets, fetches nothing, and has no telemetry, no
   self-updater and no background daemon.
-- **Reads** only the configured vault folder (symlinks are not followed; excluded directories are
-  skipped).
-- **Writes** only inside that folder: new notes in `write_folder`, and the mirror note
-  `<write_folder>/Hermes memory.md`. It never overwrites an existing file.
+- **Reads** only the configured vault folder: excluded directories are skipped, directory
+  symlinks are not followed, and a **file symlink inside the vault is skipped** rather than read
+  (otherwise a link to `~/.ssh/id_rsa` would be indexed).
+- **Writes** are confined to the vault: a folder is rejected if it is absolute, contains `..`, or
+  names an excluded directory, and containment is checked *before* any file is created. New notes
+  use `O_EXCL`, so an existing file is never replaced — not even by a racing writer. The mirror
+  only rewrites a note carrying its own `<!-- managed by mdvault -->` marker; any other
+  `Hermes memory.md` is left untouched and a suffixed name is used instead.
 - **No secrets in the vault.** The bundled skill instructs the agent not to write credentials
   there, because a vault is usually synced and often in git.
 - Plugin state (`$HERMES_HOME/mdvault/config.json`) holds the vault path and settings — nothing

@@ -6,36 +6,43 @@ vault, a notes repo, a docs folder, a diary.
 
 Retrieval is deliberately local and explainable:
 
-* BM25 over note tokens (k1=1.2, b=0.75), field-weighted title/heading hits
-* CJK text is indexed as character bigrams, so Japanese/Chinese notes rank correctly
-  without a segmenter or an embedding service
+* BM25 over note tokens (k1=1.2, b=0.75), field-weighted title/heading/tag hits
+* mixed-script text is split into Latin words and CJK runs; CJK runs are indexed as
+  character bigrams, so Japanese/Chinese notes rank without a segmenter or embeddings
 * whole-query phrase and adjacent-bigram bonuses
-* a light recency tiebreak, then path order — deterministic results every time
+* a light recency factor, then path order — deterministic for a given corpus and clock
 
 The index is held in memory and refreshed with a stat() sweep, so re-reads only touch
-files whose mtime or size changed.
+files whose mtime or size changed. Reads skip symlinks; writes are confined to the vault
+and created with O_EXCL, so a competing writer can never be overwritten.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
+import threading
 import time
-
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-INDEX_FORMAT = 1
+INDEX_FORMAT = 2
 
-# Word characters, or a run of CJK. \w covers Latin/digits/underscore plus CJK.
-_TOKEN_RE = re.compile(r"[\w\-\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]+", re.UNICODE)
-_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]")
+# Latin/digit runs or CJK runs. Splitting them at the regex level is what keeps
+# "Docker化する" searchable: one mixed token would send the whole thing down the
+# CJK-bigram path and silently lose "docker".
+_LATIN_RE = r"[A-Za-z0-9_]+"
+_CJK_RANGE = r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]"
+_TOKEN_RE = re.compile(rf"{_LATIN_RE}|{_CJK_RANGE}+", re.UNICODE)
+_CJK_RE = re.compile(_CJK_RANGE)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
-_TAG_INLINE_RE = re.compile(r"(?<![\w&])#([A-Za-z][\w/-]{1,40})")
+# No tag when the '#' opens a URL fragment ("...#anchor").
+_TAG_INLINE_RE = re.compile(r"(?<![\w&/#])#([A-Za-z][\w/-]{1,40})")
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", re.DOTALL)
 _WS_RE = re.compile(r"\s+")
 
@@ -54,7 +61,7 @@ def _is_cjk(text: str) -> bool:
 
 
 def tokenize(text: str) -> list[str]:
-    """Lowercased tokens. CJK runs become overlapping character bigrams."""
+    """Lowercased tokens. Latin words stay whole; CJK runs become character bigrams."""
     out: list[str] = []
     for raw in _TOKEN_RE.findall(text.lower()):
         if _is_cjk(raw):
@@ -64,7 +71,7 @@ def tokenize(text: str) -> list[str]:
                 out.extend(raw[i : i + 2] for i in range(len(raw) - 1))
             continue
         for piece in raw.split("-"):
-            if len(piece) < 2 or piece in _STOPWORDS or piece.isdigit():
+            if len(piece) < 2 or piece in _STOPWORDS:
                 continue
             out.append(piece)
     return out
@@ -89,6 +96,7 @@ class Note:
     size: int
     sections: list[Section] = field(default_factory=list)
     text: str = ""
+    text_lower: str = ""
     tokens: Counter[str] = field(default_factory=Counter)
     length: int = 0
     tag_tokens: set[str] = field(default_factory=set)
@@ -110,10 +118,10 @@ class Config:
     vault_path: Path
     include_globs: tuple[str, ...] = ("*.md", "*.markdown")
     exclude_dirs: tuple[str, ...] = (".obsidian", ".git", "node_modules", ".trash", ".venv", "__pycache__")
-    max_notes: int = 5000
+    max_notes: int = 5000  # 0 or negative = no cap
     max_file_bytes: int = 1_000_000
     follow_symlinks: bool = False
-    prefetch_limit: int = 4
+    prefetch_limit: int = 4  # 0 disables auto-recall
     prefetch_chars: int = 1800
     search_limit: int = 6
     auto_recall: bool = True
@@ -162,6 +170,7 @@ class Config:
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str, int]:
     """Minimal YAML frontmatter reader: scalars and inline/bullet lists only."""
+    text = text.lstrip("\ufeff")
     match = _FRONTMATTER_RE.match(text)
     if not match:
         return {}, text, 0
@@ -239,6 +248,7 @@ def parse_note(raw: str, path: str, mtime: float, size: int) -> Note:
     note = Note(path=path, title=title, tags=tags, mtime=mtime, size=size)
     note.sections = sections
     note.text = body.strip()
+    note.text_lower = note.text.lower()
     note.tokens = Counter(tokenize(f"{title}\n{' '.join(tags)}\n{note.text}"))
     note.length = sum(note.tokens.values())
     note.title_tokens = set(tokenize(title))
@@ -248,20 +258,34 @@ def parse_note(raw: str, path: str, mtime: float, size: int) -> Note:
 
 
 class VaultIndex:
-    """In-memory index over one vault directory."""
+    """In-memory index over one vault directory.
+
+    ``refresh()`` mutates the note map and corpus statistics while ``search()`` reads
+    them, so both take the instance lock. Searches serialize for the duration of a
+    ranking pass (single-digit milliseconds), which is cheaper than copying the note map.
+    """
 
     def __init__(self, config: Config):
         self.config = config
         self._notes: dict[str, Note] = {}
         self._df: Counter[str] = Counter()
-
         self._avgdl: float = 0.0
         self._dirty = True
         self._last_scan = 0.0
+        self._lock = threading.RLock()
         self.last_scan_error: str | None = None
         self.skipped: int = 0
+        self.truncated: bool = False
 
     # -- scanning ---------------------------------------------------------
+
+    def _matches_glob(self, filename: str) -> bool:
+        lowered = filename.lower()
+        for pattern in self.config.include_globs:
+            suffix = pattern[1:] if pattern.startswith("*") else pattern
+            if lowered.endswith(suffix.lower()):
+                return True
+        return False
 
     def _iter_files(self) -> Iterator[tuple[Path, str]]:
         root = self.config.vault_path
@@ -270,9 +294,13 @@ class VaultIndex:
                 d for d in dirnames if d not in self.config.exclude_dirs and not d.startswith(".git")
             )
             for filename in sorted(filenames):
-                if not any(filename.lower().endswith(g.lstrip("*")) for g in self.config.include_globs):
+                if not self._matches_glob(filename):
                     continue
                 full = Path(dirpath) / filename
+                # A file symlink can point anywhere on disk (an SSH key, /etc/shadow).
+                # Reading it would import data the user never put in the vault.
+                if full.is_symlink():
+                    continue
                 try:
                     rel = full.relative_to(root).as_posix()
                 except ValueError:
@@ -285,40 +313,44 @@ class VaultIndex:
         if not root.is_dir():
             self.last_scan_error = f"vault not found: {root}"
             return
-        seen: set[str] = set()
-        added = 0
-        skipped = 0
-        for full, rel in self._iter_files():
-            if len(seen) >= self.config.max_notes:
-                skipped += 1
-                continue
-            try:
-                stat = full.stat()
-            except OSError:
-                continue
-            if stat.st_size > self.config.max_file_bytes:
-                skipped += 1
-                continue
-            seen.add(rel)
-            known = self._notes.get(rel)
-            if known and not force and known.mtime == stat.st_mtime and known.size == stat.st_size:
-                continue
-            try:
-                raw = full.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            self._notes[rel] = parse_note(raw, rel, stat.st_mtime, stat.st_size)
-            added += 1
-        for rel in list(self._notes):
-            if rel not in seen:
-                del self._notes[rel]
+        with self._lock:
+            seen: set[str] = set()
+            added = 0
+            skipped = 0
+            truncated = False
+            cap = self.config.max_notes if self.config.max_notes and self.config.max_notes > 0 else 0
+            for full, rel in self._iter_files():
+                if cap and len(seen) >= cap:
+                    truncated = True
+                    continue
+                try:
+                    stat = full.stat()
+                except OSError:
+                    continue
+                if stat.st_size > self.config.max_file_bytes:
+                    skipped += 1
+                    continue
+                seen.add(rel)
+                known = self._notes.get(rel)
+                if known and not force and known.mtime == stat.st_mtime and known.size == stat.st_size:
+                    continue
+                try:
+                    raw = full.read_text(encoding="utf-8-sig", errors="replace")
+                except OSError:
+                    continue
+                self._notes[rel] = parse_note(raw, rel, stat.st_mtime, stat.st_size)
                 added += 1
-        self.skipped = skipped
-        if added:
-            self._rebuild_stats()
-        self._dirty = False
-        self._last_scan = time.time()
-        self.last_scan_error = None
+            for rel in list(self._notes):
+                if rel not in seen:
+                    del self._notes[rel]
+                    added += 1
+            self.skipped = skipped
+            self.truncated = truncated
+            if added:
+                self._rebuild_stats()
+            self._dirty = False
+            self._last_scan = time.time()
+            self.last_scan_error = None
 
     def maybe_refresh(self, max_age: float = 2.0) -> None:
         if self._dirty or (time.time() - self._last_scan) > max_age:
@@ -332,7 +364,6 @@ class VaultIndex:
             total += note.length
         self._avgdl = (total / len(self._notes)) if self._notes else 0.0
 
-
     # -- reading ----------------------------------------------------------
 
     @property
@@ -343,20 +374,26 @@ class VaultIndex:
         return len(self._notes)
 
     def note(self, path: str) -> Note | None:
-        clean = (path or "").replace("\\", "/").lstrip("/")
+        clean = (path or "").replace("\\", "/").strip().lstrip("/")
         while clean.startswith("./"):
             clean = clean[2:]
+        clean = os.path.normpath(clean).replace("\\", "/")
+        if clean.startswith(".."):
+            return None
         return self._notes.get(clean)
 
     def recent(self, days: int = 7, limit: int = 10, folder: str | None = None) -> list[Note]:
         self.maybe_refresh()
         cutoff = time.time() - max(days, 1) * 86400
-        rows = [
-            n
-            for n in self._notes.values()
-            if n.mtime >= cutoff and (not folder or n.path.startswith(folder.rstrip("/") + "/"))
-        ]
-        rows.sort(key=lambda n: (n.mtime, n.path), reverse=True)
+        prefix = folder.rstrip("/") + "/" if folder else None
+        with self._lock:
+            rows = [
+                n
+                for n in self._notes.values()
+                if n.mtime >= cutoff and (not prefix or n.path.startswith(prefix))
+            ]
+        # Newest first; equal mtimes fall back to path ascending, matching search().
+        rows.sort(key=lambda n: (-n.mtime, n.path))
         return rows[: max(1, limit)]
 
     # -- search -----------------------------------------------------------
@@ -368,13 +405,7 @@ class VaultIndex:
             return 0.0
         return math.log(1.0 + (n - df + 0.5) / (df + 0.5))
 
-    def _score(
-        self,
-        note: Note,
-        terms: list[str],
-        phrase: str,
-        phrase_pairs: set[str],
-    ) -> float:
+    def _score(self, note: Note, terms: list[str], phrase: str, phrase_pairs: set[str], now: float) -> float:
         k1, b = 1.2, 0.75
         score = 0.0
         avgdl = self._avgdl or 1.0
@@ -382,14 +413,18 @@ class VaultIndex:
         for term in terms:
             freq = note.tokens.get(term, 0)
             matched = freq
-            if not freq and len(term) >= 4:
-                # Prefix credit, scanned over THIS note's tokens: the bound is the note's
-                # distinct vocabulary (hundreds), not the corpus vocabulary (10^5). Measured
-                # against a precomputed bisect map on the corpus vocabulary, this is ~2x
-                # faster — see scripts/bench.py.
-                hits = [note.tokens[t] for t in note.tokens if t.startswith(term) and len(t) <= len(term) + 4]
-                if hits:
-                    matched = 0.6 * sum(hits)
+            if not freq:
+                if len(term) == 1 and _is_cjk(term):
+                    # A lone kanji never survives bigram indexing; fall back to a
+                    # bounded substring count so "猫" finds "猫が好き".
+                    matched = min(note.text_lower.count(term), 5)
+                elif len(term) >= 4:
+                    # Prefix credit, scanned over THIS note's tokens: the bound is the
+                    # note's own vocabulary (hundreds), not the corpus (10^5). Measured
+                    # against a corpus-wide bisect map, this is ~2x faster.
+                    hits = [note.tokens[t] for t in note.tokens if t.startswith(term) and len(t) <= len(term) + 4]
+                    if hits:
+                        matched = 0.6 * sum(hits)
             if not matched:
                 continue
             idf = self._idf(term)
@@ -407,21 +442,17 @@ class VaultIndex:
                 score += 1.6 * idf
 
         if phrase and len(phrase) >= 4:
-            haystack = note.text.lower()
-            title_hit = phrase in note.title.lower()
-            hits = haystack.count(phrase)
-            if title_hit:
+            hits = note.text_lower.count(phrase)
+            if phrase in note.title.lower():
                 score += 3.0
             score += 1.1 * min(hits, 3)
 
-        if phrase_pairs:
-            body_tokens = note.tokens
-            for pair in phrase_pairs:
-                left, right = pair.split(" ")
-                if body_tokens.get(left) and body_tokens.get(right):
-                    score += 0.35
+        for pair in phrase_pairs:
+            left, right = pair.split(" ")
+            if note.tokens.get(left) and note.tokens.get(right):
+                score += 0.35
 
-        age_days = max(0.0, (time.time() - note.mtime) / 86400.0)
+        age_days = max(0.0, (now - note.mtime) / 86400.0)
         half_life = max(1.0, self.config.recency_half_life_days)
         score *= 1.0 + 0.12 * math.exp(-age_days / half_life)
         return score
@@ -438,7 +469,6 @@ class VaultIndex:
         terms = tokenize(norm)
         if not terms:
             return []
-        # de-duplicate while keeping order
         seen: set[str] = set()
         ordered_terms = [t for t in terms if not (t in seen or seen.add(t))]
         phrase = norm if len(norm) >= 4 else ""
@@ -448,23 +478,37 @@ class VaultIndex:
 
         folder_prefix = folder.rstrip("/") + "/" if folder else None
         tag_key = tag.lower().lstrip("#") if tag else None
-        scored: list[tuple[float, Note]] = []
-        for note in self._notes.values():
-            if folder_prefix and not note.path.startswith(folder_prefix):
-                continue
-            if tag_key and tag_key not in note.tag_tokens:
-                continue
-            value = self._score(note, ordered_terms, phrase, phrase_pairs)
-            if value > 0:
-                scored.append((value, note))
+        now = time.time()
+
+        with self._lock:
+            scored: list[tuple[float, Note]] = []
+            for note in self._notes.values():
+                if folder_prefix and not note.path.startswith(folder_prefix):
+                    continue
+                if tag_key and tag_key not in note.tag_tokens:
+                    continue
+                value = self._score(note, ordered_terms, phrase, phrase_pairs, now)
+                if value > 0:
+                    scored.append((value, note))
 
         scored.sort(key=lambda item: (-item[0], -item[1].mtime, item[1].path))
-        top = scored[: max(1, limit or self.config.search_limit)]
+        top = scored[: max(1, limit if limit is not None else self.config.search_limit)]
         max_score = top[0][0] if top else 0.0
         results: list[dict[str, Any]] = []
         for value, note in top:
             entry = note.to_public()
             entry["score"] = round(value / max_score, 3) if max_score else 0.0
+            entry["raw_score"] = round(value, 4)
+            entry["matched_in"] = [
+                field_name
+                for field_name, hit in (
+                    ("title", any(t in note.title_tokens for t in ordered_terms)),
+                    ("tag", any(t in note.tag_tokens for t in ordered_terms)),
+                    ("heading", any(t in note.heading_tokens for t in ordered_terms)),
+                    ("body", any(note.tokens.get(t) for t in ordered_terms)),
+                )
+                if hit
+            ]
             entry["snippet"] = self._snippet(note, ordered_terms, phrase)
             results.append(entry)
         return results
@@ -492,10 +536,7 @@ class VaultIndex:
             found = lowered.find(phrase)
             if found != -1:
                 anchor = found
-        if anchor == -1:
-            start = 0
-        else:
-            start = max(0, anchor - width // 3)
+        start = 0 if anchor == -1 else max(0, anchor - width // 3)
         end = min(len(text), start + width)
         snippet = text[start:end].strip()
         if start > 0:
@@ -509,16 +550,18 @@ class VaultIndex:
     def stats(self, refresh: bool = True) -> dict[str, Any]:
         if refresh:
             self.maybe_refresh()
-        newest = max((n.mtime for n in self._notes.values()), default=0)
-        return {
-            "vault": str(self.config.vault_path),
-            "notes": len(self._notes),
-            "words": sum(n.length for n in self._notes.values()),
-            "skipped": self.skipped,
-            "newest": datetime.fromtimestamp(newest, tz=timezone.utc).isoformat(timespec="seconds") if newest else None,
-            "last_scan": datetime.fromtimestamp(self._last_scan or time.time(), tz=timezone.utc).isoformat(timespec="seconds"),
-            "error": self.last_scan_error,
-        }
+        with self._lock:
+            newest = max((n.mtime for n in self._notes.values()), default=0)
+            return {
+                "vault": str(self.config.vault_path),
+                "notes": len(self._notes),
+                "words": sum(n.length for n in self._notes.values()),
+                "skipped": self.skipped,
+                "truncated": self.truncated,
+                "newest": datetime.fromtimestamp(newest, tz=timezone.utc).isoformat(timespec="seconds") if newest else None,
+                "last_scan": datetime.fromtimestamp(self._last_scan or time.time(), tz=timezone.utc).isoformat(timespec="seconds"),
+                "error": self.last_scan_error,
+            }
 
 
 # -- writing ---------------------------------------------------------------
@@ -526,10 +569,36 @@ class VaultIndex:
 _UNSAFE_NAME = re.compile(r"[^\w\s.\-()\[\]&']+", re.UNICODE)
 
 
+class VaultWriteError(ValueError):
+    """A write was refused because it would leave the vault."""
+
+
 def slugify(title: str, fallback: str = "note") -> str:
     cleaned = _UNSAFE_NAME.sub("", (title or "").strip()).strip(" .")
     cleaned = _WS_RE.sub(" ", cleaned)[:80].strip()
     return cleaned or fallback
+
+
+def resolve_write_dir(config: Config, folder: str | None) -> Path:
+    """Resolve a vault-relative write target, refusing anything that escapes the vault.
+
+    Validated *before* any I/O: an earlier version wrote the file and then raised while
+    computing its return path, leaving data outside the vault while reporting failure.
+    """
+    root = config.vault_path.resolve()
+    raw = (folder if folder is not None else config.write_folder or "").strip().replace("\\", "/")
+    raw = raw.strip("/")
+    if not raw:
+        return root
+    parts = [p for p in raw.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        raise VaultWriteError("folder must stay inside the vault")
+    if any(p in config.exclude_dirs for p in parts):
+        raise VaultWriteError(f"folder {raw!r} is excluded from the vault index")
+    directory = (root / "/".join(parts)).resolve()
+    if directory != root and not directory.is_relative_to(root):
+        raise VaultWriteError("folder must stay inside the vault")
+    return directory
 
 
 def write_note(
@@ -539,40 +608,57 @@ def write_note(
     tags: Iterable[str] | None = None,
     folder: str | None = None,
 ) -> dict[str, Any]:
-    """Create a new Markdown note in the vault. Never overwrites an existing file."""
+    """Create a new Markdown note in the vault.
+
+    Creation uses ``O_CREAT|O_EXCL`` on the final name, so a file that appears between
+    the name check and the write (Obsidian, Syncthing, a second agent turn) is never
+    overwritten — the next free name is used instead.
+    """
     root = config.vault_path.resolve()
-    target_folder = (folder or config.write_folder or "").strip().strip("/")
-    if target_folder.startswith(".."):
-        raise ValueError("folder must stay inside the vault")
-    directory = (root / target_folder).resolve() if target_folder else root
-    if not str(directory).startswith(str(root)):
-        raise ValueError("folder must stay inside the vault")
+    clean_title = _WS_RE.sub(" ", (title or "").strip().replace("\n", " ").replace("\r", " "))
+    directory = resolve_write_dir(config, folder)
     directory.mkdir(parents=True, exist_ok=True)
 
-    name = f"{slugify(title)}.md"
-    path = directory / name
-    counter = 2
-    while path.exists():
-        path = directory / f"{slugify(title)} {counter}.md"
-        counter += 1
-        if counter > 50:
-            raise FileExistsError("too many notes with that title")
+    slug = slugify(clean_title)
+    handle: int | None = None
+    path: Path | None = None
+    for counter in range(1, 51):
+        candidate = directory / (f"{slug}.md" if counter == 1 else f"{slug} {counter}.md")
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise VaultWriteError(f"cannot create note: {exc}") from exc
+        handle, path = fd, candidate
+        break
+    if handle is None or path is None:
+        raise FileExistsError("too many notes with that title")
 
     body = content.strip()
     tag_list = [str(t).lstrip("#").strip() for t in (tags or []) if str(t).strip()]
-    if not _FRONTMATTER_RE.match(body):
+    if not _FRONTMATTER_RE.match(body.lstrip("\ufeff")):
         stamp = datetime.now().strftime("%Y-%m-%d")
-        header = ["---", f"title: {title.strip() or path.stem}"]
+        header = ["---", f"title: {json.dumps(clean_title or path.stem, ensure_ascii=False)}"]
         if tag_list:
-            header.append("tags: [" + ", ".join(tag_list) + "]")
+            # Block style, one quoted scalar per line: an inline [a, b] list breaks on
+            # tags containing commas, brackets or quotes.
+            header.append("tags:")
+            header.extend(f"  - {json.dumps(tag, ensure_ascii=False)}" for tag in tag_list)
         header += [f"created: {stamp}", "source: hermes", "---", ""]
         body = "\n".join(header) + body
-    tmp = path.with_suffix(".md.tmp")
-    tmp.write_text(body + ("\n" if not body.endswith("\n") else ""), encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(body + ("\n" if not body.endswith("\n") else ""))
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
     return {
         "path": path.relative_to(root).as_posix(),
         "absolute": str(path),
-        "title": title.strip() or path.stem,
+        "title": clean_title or path.stem,
         "tags": tag_list,
     }

@@ -188,8 +188,8 @@ def test_write_note_creates_frontmatter_and_never_overwrites(tmp_path):
     assert second["path"] == "inbox/Trip plan 2.md"
     body = (tmp_path / first["path"]).read_text(encoding="utf-8")
     assert body.startswith("---")
-    assert "title: Trip plan" in body
-    assert "tags: [japan]" in body
+    assert 'title: "Trip plan"' in body
+    assert '- "japan"' in body
 
 
 def test_write_note_rejects_escaping_folder(tmp_path):
@@ -222,7 +222,23 @@ def test_skipped_counts_files_over_the_cap(tmp_path):
     make_vault(tmp_path, {f"n{i}.md": f"# Note {i}\n\nbody {i}\n" for i in range(5)})
     index = build(tmp_path, max_notes=3)
     assert index.count() == 3
-    assert index.stats()["skipped"] == 2
+    stats = index.stats()
+    assert stats["truncated"] is True
+    assert stats["skipped"] == 0
+
+
+def test_unlimited_notes_when_cap_is_zero(tmp_path):
+    make_vault(tmp_path, {f"n{i}.md": f"# Note {i}\n\nbody {i}\n" for i in range(5)})
+    index = build(tmp_path, max_notes=0)
+    assert index.count() == 5
+    assert index.stats()["truncated"] is False
+
+
+def test_oversized_file_is_skipped_and_counted(tmp_path):
+    make_vault(tmp_path, {"big.md": "# Big\n\n" + ("x" * 500), "small.md": "# Small\n\ntext\n"})
+    index = build(tmp_path, max_file_bytes=100)
+    assert index.count() == 1
+    assert index.stats()["skipped"] == 1
 
 
 def test_prefix_expansion_survives_large_vocabulary(tmp_path):

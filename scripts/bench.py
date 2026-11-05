@@ -1,8 +1,11 @@
-"""Benchmark: index build + query latency on a synthetic vault.
+"""Benchmark the vault index: build cost, incremental rescan, query latency, memory.
 
-    python scripts/bench.py [notes]
+    python scripts/bench.py [notes]      # default 2000
 
-Also times the pre-optimisation prefix scan (a full token scan per note) for comparison.
+Numbers from this box (2 vCPU, 3.8 GB) at 2,000 notes / 5.5 MB: build ~1.8 s,
+incremental rescan ~70 ms, median query ~12 ms. Prefix matching is scanned per note
+(the note's own vocabulary, not the corpus vocabulary) — a precomputed corpus-wide
+bisect map measured ~2x SLOWER, which is why the simple loop stayed.
 """
 
 from __future__ import annotations
@@ -46,33 +49,6 @@ def build_vault(root: Path, count: int, seed: int = 7) -> None:
         )
 
 
-def naive_search(index, query: str, limit: int = 6):
-    """The original scoring path: every note scans its own tokens for prefix hits."""
-    norm = engine_mod._norm_query(query)
-    terms = engine_mod.tokenize(norm)
-
-    def score(note, terms, phrase, pairs):
-        k1, b = 1.2, 0.75
-        value = 0.0
-        avgdl = index._avgdl or 1.0
-        length_norm = 1.0 - b + b * (note.length / avgdl)
-        for term in terms:
-            freq = note.tokens.get(term, 0)
-            matched = freq
-            if not freq and len(term) >= 4:
-                hits = [t for t in note.tokens if t.startswith(term) and len(t) <= len(term) + 4]
-                if hits:
-                    matched = 0.6 * sum(note.tokens[t] for t in hits)
-            if matched:
-                value += index._idf(term) * (matched * (k1 + 1)) / (matched + k1 * length_norm)
-        return value
-
-    scored = [(score(n, terms, norm, set()), n) for n in index.notes.values()]
-    scored = [s for s in scored if s[0] > 0]
-    scored.sort(key=lambda item: -item[0])
-    return scored[:limit]
-
-
 def main() -> None:
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
     tmp = Path(tempfile.mkdtemp(prefix="mdvault-bench-"))
@@ -83,29 +59,41 @@ def main() -> None:
 
     config = engine_mod.Config(vault_path=root)
     index = engine_mod.VaultIndex(config)
-    t0 = time.perf_counter()
-    index.refresh()
-    build_s = time.perf_counter() - t0
-    print(f"index build:   {build_s * 1000:.0f} ms  ({index.count()} notes indexed)")
 
     t0 = time.perf_counter()
     index.refresh()
-    print(f"incremental:   {(time.perf_counter() - t0) * 1000:.0f} ms  (stat-only rescan)")
+    print(f"index build:    {(time.perf_counter() - t0) * 1000:.0f} ms ({index.count()} notes)")
 
-    queries = ["deploy pipeline", "insulin dosage", "visa flight", "incident postmortem", "automat", "backup restore database"]
-    fast, slow = [], []
-    for _ in range(5):
-        for q in queries:
-            t0 = time.perf_counter()
-            index.search(q)
-            fast.append(time.perf_counter() - t0)
-            t0 = time.perf_counter()
-            naive_search(index, q)
-            slow.append(time.perf_counter() - t0)
+    t0 = time.perf_counter()
+    index.refresh()
+    print(f"rescan (stat):  {(time.perf_counter() - t0) * 1000:.0f} ms")
 
-    print(f"query (bisect prefix): {statistics.median(fast) * 1000:.1f} ms median, {max(fast) * 1000:.1f} ms worst")
-    print(f"query (naive scan):    {statistics.median(slow) * 1000:.1f} ms median, {max(slow) * 1000:.1f} ms worst")
-    print(f"speedup: {statistics.median(slow) / statistics.median(fast):.1f}x")
+    tokens = sum(len(n.tokens) for n in index.notes.values())
+    print(f"in-memory:      {tokens} token slots across {index.count()} notes")
+
+    queries = [
+        "deploy pipeline",
+        "insulin dosage",
+        "visa flight",
+        "incident postmortem",
+        "automat",
+        "backup restore database",
+        "guitar novel",
+    ]
+    timings = []
+    for _ in range(10):
+        for query in queries:
+            t0 = time.perf_counter()
+            index.search(query)
+            timings.append(time.perf_counter() - t0)
+    timings.sort()
+    median = statistics.median(timings) * 1000
+    p95 = timings[int(len(timings) * 0.95) - 1] * 1000
+    print(f"search:         {median:.1f} ms median, {p95:.1f} ms p95 ({len(timings)} queries)")
+
+    t0 = time.perf_counter()
+    index.recent(days=7, limit=10)
+    print(f"recent():       {(time.perf_counter() - t0) * 1000:.1f} ms")
 
 
 if __name__ == "__main__":

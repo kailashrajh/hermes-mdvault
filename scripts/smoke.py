@@ -124,7 +124,8 @@ def main() -> int:
     provider.on_memory_write("replace", "memory", "Kai prefers blunt feedback.", {"previous_content": "Kai prefers direct feedback."})
     text = mirror.read_text(encoding="utf-8")
     check("replace rewrote the entry", "blunt feedback" in text and "direct feedback" not in text, text)
-    provider.on_memory_write("remove", "memory", "Kai prefers blunt feedback.", {"previous_content": "Kai prefers blunt feedback."})
+    # Hermes sends removals with an EMPTY content and the entry in previous_content.
+    provider.on_memory_write("remove", "memory", "", {"previous_content": "Kai prefers blunt feedback."})
     text = mirror.read_text(encoding="utf-8")
     check("remove deleted the entry", "blunt feedback" not in text, text)
 
