@@ -39,6 +39,19 @@ mdvault indexes CJK runs as **character bigrams**, folds **katakana to hiragana*
 
 Folding is index-only: snippets and the files on disk keep the original script.
 
+Reproduce it: `python scripts/bench_cjk.py` builds one small vault and runs the same ten
+queries through mdvault and through SQLite FTS5 (`porter unicode61`). Current result:
+
+```text
+recall@10: mdvault 10/10   fts5 2/10
+```
+
+FTS5's two hits are words that happen to sit alone in a heading, separated by spaces; in
+running Japanese text it returns nothing.
+
+**Known limit:** kana↔kanji readings (`にほん` → `日本`) need a morphological dictionary.
+mdvault does not ship one. Katakana↔hiragana folds because it is a pure codepoint mapping.
+
 
 ## Install
 
@@ -194,6 +207,7 @@ plugins/mdvault/
 ├── mirror.py         # mirror writer for built-in memory writes (pure, no Hermes imports)
 ├── cli.py             # hermes mdvault status|search|explain|reindex
 ├── config_schema.py   # dashboard memory panel
+├── mirror.py         # mirror writer for built-in memory writes (pure, no Hermes imports)
 ├── plugin.yaml        # manifest
 └── skills/vault-notes/SKILL.md
 ```
