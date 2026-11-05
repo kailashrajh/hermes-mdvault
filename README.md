@@ -168,6 +168,7 @@ Layout:
 plugins/mdvault/
 ├── __init__.py        # MemoryProvider implementation + register()
 ├── vault_engine.py    # scanning, parsing, BM25 ranking, note writing (stdlib only)
+├── mirror.py         # mirror writer for built-in memory writes (pure, no Hermes imports)
 ├── cli.py             # hermes mdvault status|search|explain|reindex
 ├── config_schema.py   # dashboard memory panel
 ├── plugin.yaml        # manifest
