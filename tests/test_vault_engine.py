@@ -38,7 +38,7 @@ def test_tokenize_cjk_bigrams():
 
 def test_tokenize_mixed_script():
     tokens = tokenize("Hermes メモリ is local")
-    assert "hermes" in tokens and "メモ" in tokens and "local" in tokens
+    assert "hermes" in tokens and "めも" in tokens and "local" in tokens
 
 
 # -- parsing ---------------------------------------------------------------

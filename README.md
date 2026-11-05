@@ -18,6 +18,28 @@ hermes › From your notes: you decided to apply for the Critical Skills Employm
 That answer came from a file in a folder. Nothing was uploaded anywhere, and the note is still
 editable in Obsidian.
 
+## The gap it closes: Japanese, Chinese and Korean recall
+
+Most vault memories use SQLite FTS5 with the `unicode61` tokenizer. It treats a run of CJK
+characters as **one token**, so a substring query returns nothing:
+
+| query | FTS5 `unicode61` | mdvault |
+|---|---|---|
+| `日本語` | 0 hits | 1 hit |
+| `メモリ` | 0 hits | 1 hit |
+| `新幹線` | 0 hits | 1 hit |
+
+mdvault indexes CJK runs as **character bigrams**, folds **katakana to hiragana**, and applies
+**NFKC** before tokenizing. That means:
+
+- a `かたかな` query finds a note that only says `カタカナ` (and the reverse);
+- full-width `ＡＰＩ` matches `API`;
+- `Docker化する` indexes as `docker`, `化す`, `する` — the Latin word survives;
+- Russian, Greek, Korean and accented Latin are tokenized too, not dropped.
+
+Folding is index-only: snippets and the files on disk keep the original script.
+
+
 ## Install
 
 From the Hermes plugin catalog (once listed):

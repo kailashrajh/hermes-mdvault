@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 import threading
 import time
 from collections import Counter
@@ -60,8 +61,18 @@ def _is_cjk(text: str) -> bool:
     return bool(_CJK_RE.search(text))
 
 
+def _fold_kana(text: str) -> str:
+    """Fold katakana to hiragana so either script matches the other.
+
+    A learner writes カタカナ in one note and かたかな in the next; without this the two
+    never meet. Only the token stream is folded — stored text and snippets stay original.
+    """
+    return "".join(chr(ord(ch) - 0x60) if "\u30a1" <= ch <= "\u30f6" else ch for ch in text)
+
+
 def tokenize(text: str) -> list[str]:
     """Lowercased tokens. Latin words stay whole; CJK runs become character bigrams."""
+    text = _fold_kana(unicodedata.normalize("NFKC", text))
     out: list[str] = []
     for raw in _TOKEN_RE.findall(text.lower()):
         if _is_cjk(raw):

@@ -88,7 +88,7 @@ def test_mixed_script_keeps_latin_words():
 
 def test_pure_cjk_still_bigrams():
     tokens = tokenize("メモリ")
-    assert tokens == ["メモ", "モリ"]
+    assert tokens == ["めも", "もり"]  # katakana folded to hiragana on purpose
 
 
 def test_single_kanji_query_matches(tmp_path):
