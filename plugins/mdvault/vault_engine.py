@@ -37,8 +37,8 @@ INDEX_FORMAT = 2
 # Latin/digit runs or CJK runs. Splitting them at the regex level is what keeps
 # "Docker化する" searchable: one mixed token would send the whole thing down the
 # CJK-bigram path and silently lose "docker".
-_LATIN_RE = r"[^\W\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]+"
-_CJK_RANGE = r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]"
+_LATIN_RE = r"[^\W\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\u1100-\u11ff]+"
+_CJK_RANGE = r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\u1100-\u11ff]"
 _TOKEN_RE = re.compile(rf"{_LATIN_RE}|{_CJK_RANGE}+", re.UNICODE)
 _CJK_RE = re.compile(_CJK_RANGE)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
@@ -67,7 +67,7 @@ def _fold_kana(text: str) -> str:
     A learner writes カタカナ in one note and かたかな in the next; without this the two
     never meet. Only the token stream is folded — stored text and snippets stay original.
     """
-    return "".join(chr(ord(ch) - 0x60) if "\u30a1" <= ch <= "\u30f6" else ch for ch in text)
+    return "".join(chr(ord(ch) - 0x60) if "\u30a1" <= ch <= "\u30fa" else ch for ch in text)
 
 
 def tokenize(text: str) -> list[str]:

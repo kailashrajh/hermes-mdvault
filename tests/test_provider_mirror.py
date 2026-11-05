@@ -107,5 +107,5 @@ def test_mirror_rejects_symlinked_note(provider, tmp_path):
     p._write_mirror("add", "memory", "should not land", "")
     # external file must be untouched
     assert external.read_text() == "# external\n"
-    # and no symlink was followed to write into it
-    assert not (inbox / "Hermes memory.md").is_symlink() or True
+    # and no symlink was followed to write into it: the external file is unchanged
+    assert "should not land" not in external.read_text()

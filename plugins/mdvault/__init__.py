@@ -188,9 +188,9 @@ def _config_yaml_block() -> dict[str, Any]:
 def _resolve_settings(hermes_home: Path) -> dict[str, Any]:
     """Precedence, lowest to highest: sidecar/dashboard JSON → config.yaml block → env var.
 
-    This matches ``cli._settings()``. Sidecar first means a value saved by
-    ``hermes memory setup`` or the dashboard survives even when ``config.yaml`` carries
-    a stale ``memory.mdvault`` block, and ``HERMES_VAULT_PATH`` wins for per-project runs.
+    This matches ``cli._settings()``. The dashboard sidecar is the base; a non-empty
+    ``memory.mdvault`` block in ``config.yaml`` overrides it (so a hand-edited config.yaml
+    wins), and ``HERMES_VAULT_PATH`` wins for per-project runs.
     """
     settings: dict[str, Any] = {}
     settings.update(_sidecar_config(hermes_home))

@@ -117,7 +117,7 @@ def main() -> int:
             )
         total = len(QUERIES)
         print("-" * 72)
-        print(f"recall@{total}: mdvault {md_ok}/{total}   fts5 {fts_ok}/{total}")
+        print(f"found in top 5: mdvault {md_ok}/{total}   fts5 {fts_ok}/{total}")
         return 0 if md_ok == total else 1
 
 
