@@ -1,0 +1,8 @@
+name: mdvault
+version: 1.0.0
+description: "Markdown vault memory — recall from and write to a folder of Markdown notes."
+author: kailashrajh
+license: MIT
+homepage: https://github.com/kailashrajh/hermes-mdvault
+requires_hermes: ">=0.22.0"
+tags: [memory, notes, markdown, obsidian, local-first]
