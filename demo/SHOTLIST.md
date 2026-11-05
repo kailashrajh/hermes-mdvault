@@ -12,7 +12,8 @@ Terminal: large font, dark theme, no notifications. Record at 1080p.
 | 0:08–0:18 | `hermes -p mdvault-demo mdvault status` | "mdvault indexes the vault — 4 notes, no database, no embeddings, no network." |
 | 0:18–0:45 | `hermes -p mdvault-demo chat -q "What did I decide about Ireland, and why? One sentence."` | Let the answer land. "It never read that file in this session. The note was injected before the turn — no tool call, no prompt." |
 | 0:45–1:00 | `hermes -p mdvault-demo chat -q "Remember that the Japan trip needs a Suica card."` then `cat ~/mdvault-demo/vault/inbox/*.md` | "Writing goes back into the vault — a real note with frontmatter, not a row in someone's cloud." |
-| 1:00–1:15 | `hermes -p mdvault-demo chat -q "日本語のノートに何を書いた?"` | "Japanese notes too — CJK bigram indexing, no segmenter." |
+| 1:00–1:15 | `hermes -p mdvault-demo chat -q "かたかなについて何を書いた?"` | "Hiragana query, katakana note — and FTS5-based memories return nothing here." |
+| 1:15–1:22 | `python scripts/bench_cjk.py` (cut to the last line) | "Ten Japanese queries: 10/10 here, 2/10 on FTS5." |
 | 1:15–1:30 | `hermes -p mdvault-demo mdvault search "critical skills"` + the file open in Obsidian | "It's a normal Obsidian vault. Edit it by hand, git it, sync it. The agent sees the change next turn." |
 
 Closing card (3 s): `mdvault — your notes are the memory` + repo URL.

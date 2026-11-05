@@ -175,6 +175,29 @@ the filename.
   else. The vault itself is outside `$HERMES_HOME`, so `hermes backup` does not copy it: back it
   up like any other document folder.
 
+## Prior art, and what is different
+
+The Markdown-vault-as-memory pattern is not new, and pretending otherwise would be dishonest:
+
+- **hwiki** (ottosulin) — the reference implementation: a Markdown wiki with FTS5 recall,
+  Obsidian compatibility, `[[wikilinks]]` and a memory staging folder. Well built; if you want a
+  wiki-shaped memory and your notes are in English, use it.
+- **entropicmem** (Ufonik88) — SQLite facts plus a Markdown vault and an interactive graph.
+  Much larger surface; excellent if you want a full memory system with an audit log.
+- **vault-view** (ergocogn) — a Desktop vault workspace: editing, backlinks, graph.
+
+mdvault is deliberately smaller, and different in three places:
+
+1. **CJK recall actually works.** FTS5/`unicode61` tokenizes a Japanese run as one token; both
+   of the vault memories above inherit that, so `メモリ` returns nothing from a note that says
+   `メモリのプラグイン`. mdvault indexes bigrams and folds kana. This is the reason the plugin
+   exists.
+2. **No database at all.** The index is an in-process BM25 structure rebuilt from file stats.
+   There is no SQLite file to back up, corrupt or migrate, and no `index.sqlite` in `HERMES_HOME`.
+3. **Nothing to install.** No Node runtime, no qmd binary, no models, no Python dependencies.
+
+If those three don't matter to you, hwiki is the better choice — and that is fine.
+
 ## Limits
 
 - **Lexical, not semantic.** It matches words, not meanings. A note that says "car" will not
